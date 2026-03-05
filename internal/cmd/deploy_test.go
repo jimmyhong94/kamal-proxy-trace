@@ -8,6 +8,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDeployCommand_TLSPreflightValidation(t *testing.T) {
+	t.Run("requires TLS to be enabled", func(t *testing.T) {
+		cmd := newDeployCommand()
+		cmd.args.DeploymentOptions.TLSPreflightEnabled = true
+		cmd.args.ServiceOptions.TLSEnabled = false
+		cmd.args.ServiceOptions.Hosts = []string{"example.com"}
+
+		err := cmd.preRun(&cobra.Command{}, []string{"test-service"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tls-preflight requires TLS to be enabled")
+	})
+
+	t.Run("incompatible with custom TLS certificates", func(t *testing.T) {
+		cmd := newDeployCommand()
+		cmd.args.DeploymentOptions.TLSPreflightEnabled = true
+		cmd.args.ServiceOptions.TLSEnabled = true
+		cmd.args.ServiceOptions.Hosts = []string{"example.com"}
+		cmd.args.ServiceOptions.TLSCertificatePath = "/path/to/cert.pem"
+
+		err := cmd.preRun(&cobra.Command{}, []string{"test-service"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tls-preflight is not compatible with custom TLS certificates")
+	})
+
+	t.Run("valid with TLS enabled and no custom certs", func(t *testing.T) {
+		cmd := newDeployCommand()
+		cmd.args.DeploymentOptions.TLSPreflightEnabled = true
+		cmd.args.ServiceOptions.TLSEnabled = true
+		cmd.args.ServiceOptions.Hosts = []string{"example.com"}
+
+		err := cmd.preRun(&cobra.Command{}, []string{"test-service"})
+		require.NoError(t, err)
+	})
+}
+
 func TestDeployCommand_CanonicalHostValidation(t *testing.T) {
 	tests := []struct {
 		name          string

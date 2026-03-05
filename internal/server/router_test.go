@@ -771,6 +771,190 @@ func TestRouter_RestoreLastSavedState(t *testing.T) {
 	assert.Equal(t, "third", body)
 }
 
+func TestRouter_TLSPreflight_NewHostsDetermination(t *testing.T) {
+	t.Run("brand new service returns all hosts", func(t *testing.T) {
+		router := testRouter(t)
+		options := ServiceOptions{Hosts: []string{"a.example.com", "b.example.com"}, TLSEnabled: true}
+		options.Normalize()
+
+		newHosts := router.newHostsForService("new-service", options)
+		assert.ElementsMatch(t, []string{"a.example.com", "b.example.com"}, newHosts)
+	})
+
+	t.Run("existing service without TLS returns all hosts", func(t *testing.T) {
+		router := testRouter(t)
+		_, target := testBackend(t, "ok", http.StatusOK)
+
+		serviceOptions := defaultServiceOptions
+		serviceOptions.Hosts = []string{"a.example.com"}
+		require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+		options := ServiceOptions{Hosts: []string{"a.example.com", "b.example.com"}, TLSEnabled: true}
+		options.Normalize()
+
+		newHosts := router.newHostsForService("svc", options)
+		assert.ElementsMatch(t, []string{"a.example.com", "b.example.com"}, newHosts)
+	})
+
+	t.Run("same hosts returns empty", func(t *testing.T) {
+		router := testRouter(t)
+		_, target := testBackend(t, "ok", http.StatusOK)
+
+		serviceOptions := defaultServiceOptions
+		serviceOptions.Hosts = []string{"a.example.com"}
+		serviceOptions.TLSEnabled = true
+		require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+		options := ServiceOptions{Hosts: []string{"a.example.com"}, TLSEnabled: true}
+		options.Normalize()
+
+		newHosts := router.newHostsForService("svc", options)
+		assert.Empty(t, newHosts)
+	})
+
+	t.Run("subset of hosts returns only new ones", func(t *testing.T) {
+		router := testRouter(t)
+		_, target := testBackend(t, "ok", http.StatusOK)
+
+		serviceOptions := defaultServiceOptions
+		serviceOptions.Hosts = []string{"a.example.com"}
+		serviceOptions.TLSEnabled = true
+		require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+		options := ServiceOptions{Hosts: []string{"a.example.com", "b.example.com"}, TLSEnabled: true}
+		options.Normalize()
+
+		newHosts := router.newHostsForService("svc", options)
+		assert.Equal(t, []string{"b.example.com"}, newHosts)
+	})
+
+	t.Run("disjoint hosts returns all new", func(t *testing.T) {
+		router := testRouter(t)
+		_, target := testBackend(t, "ok", http.StatusOK)
+
+		serviceOptions := defaultServiceOptions
+		serviceOptions.Hosts = []string{"a.example.com"}
+		serviceOptions.TLSEnabled = true
+		require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+		options := ServiceOptions{Hosts: []string{"b.example.com", "c.example.com"}, TLSEnabled: true}
+		options.Normalize()
+
+		newHosts := router.newHostsForService("svc", options)
+		assert.ElementsMatch(t, []string{"b.example.com", "c.example.com"}, newHosts)
+	})
+}
+
+func TestRouter_TLSPreflight_FailureBlocksDeploy(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "ok", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"preflight-fail.example.com"}
+	serviceOptions.TLSEnabled = true
+	serviceOptions.ACMECachePath = t.TempDir()
+
+	deploymentOptions := defaultDeploymentOptions
+	deploymentOptions.TLSPreflightEnabled = true
+	deploymentOptions.DeployTimeout = time.Millisecond * 500
+
+	err := router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, deploymentOptions)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrorTLSPreflightFailed)
+
+	// Service should not be installed
+	statusCode, _ := sendGETRequest(router, "http://preflight-fail.example.com/")
+	assert.Equal(t, http.StatusNotFound, statusCode)
+}
+
+func TestRouter_TLSPreflight_NoOpWhenNoNewHosts(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "first", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"existing.example.com"}
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSRedirect = false
+
+	// First deploy without preflight
+	require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	// Redeploy same hosts with preflight enabled - should be a no-op for preflight
+	_, second := testBackend(t, "second", http.StatusOK)
+	deploymentOptions := defaultDeploymentOptions
+	deploymentOptions.TLSPreflightEnabled = true
+
+	require.NoError(t, router.DeployService("svc", []string{second}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, deploymentOptions))
+
+	statusCode, body := sendGETRequest(router, "http://existing.example.com/")
+	assert.Equal(t, http.StatusOK, statusCode)
+	assert.Equal(t, "second", body)
+}
+
+func TestRouter_TLSPreflight_ExistingTrafficUnaffected(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "original", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"existing.example.com"}
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSRedirect = false
+
+	// Deploy initial service
+	require.NoError(t, router.DeployService("svc", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	// Try to deploy with new host + preflight (should fail because ACME staging can't verify)
+	newServiceOptions := serviceOptions
+	newServiceOptions.Hosts = []string{"existing.example.com", "new-host.example.com"}
+	newServiceOptions.ACMECachePath = t.TempDir()
+
+	deploymentOptions := defaultDeploymentOptions
+	deploymentOptions.TLSPreflightEnabled = true
+	deploymentOptions.DeployTimeout = time.Millisecond * 500
+
+	_, second := testBackend(t, "new", http.StatusOK)
+	err := router.DeployService("svc", []string{second}, defaultEmptyReaders, newServiceOptions, defaultTargetOptions, deploymentOptions)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrorTLSPreflightFailed)
+
+	// Original service should still be serving
+	statusCode, body := sendGETRequest(router, "http://existing.example.com/")
+	assert.Equal(t, http.StatusOK, statusCode)
+	assert.Equal(t, "original", body)
+}
+
+func TestRouter_TLSPreflight_HostConflictBlocksPreflight(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "existing", http.StatusOK)
+
+	// Deploy service A with a host
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"taken.example.com"}
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSRedirect = false
+	require.NoError(t, router.DeployService("service-a", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	// Try to deploy service B with the same host + preflight enabled
+	_, target2 := testBackend(t, "new", http.StatusOK)
+	conflictOptions := defaultServiceOptions
+	conflictOptions.Hosts = []string{"taken.example.com"}
+	conflictOptions.TLSEnabled = true
+	conflictOptions.ACMECachePath = t.TempDir()
+
+	deploymentOptions := defaultDeploymentOptions
+	deploymentOptions.TLSPreflightEnabled = true
+
+	err := router.DeployService("service-b", []string{target2}, defaultEmptyReaders, conflictOptions, defaultTargetOptions, deploymentOptions)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrorTLSPreflightFailed)
+	assert.Contains(t, err.Error(), "host settings conflict")
+
+	// Original service should still be serving
+	statusCode, body := sendGETRequest(router, "http://taken.example.com/")
+	assert.Equal(t, http.StatusOK, statusCode)
+	assert.Equal(t, "existing", body)
+}
+
 // Helpers
 
 func testRouter(t *testing.T) *Router {

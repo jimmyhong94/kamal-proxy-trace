@@ -44,6 +44,7 @@ func newDeployCommand() *deployCommand {
 	deployCommand.cmd.Flags().DurationVar(&deployCommand.args.DeploymentOptions.DeployTimeout, "deploy-timeout", server.DefaultDeployTimeout, "Maximum time to wait for the new target to become healthy")
 	deployCommand.cmd.Flags().DurationVar(&deployCommand.args.DeploymentOptions.DrainTimeout, "drain-timeout", server.DefaultDrainTimeout, "Maximum time to allow existing connections to drain before removing old target")
 	deployCommand.cmd.Flags().BoolVar(&deployCommand.args.DeploymentOptions.Force, "force", false, "Skip health checks and force deployment")
+	deployCommand.cmd.Flags().BoolVar(&deployCommand.args.DeploymentOptions.TLSPreflightEnabled, "tls-preflight", false, "Verify TLS can be established for new hosts before deploying")
 	deployCommand.cmd.Flags().DurationVar(&deployCommand.args.TargetOptions.HealthCheckConfig.Interval, "health-check-interval", server.DefaultHealthCheckInterval, "Interval between health checks")
 	deployCommand.cmd.Flags().DurationVar(&deployCommand.args.TargetOptions.HealthCheckConfig.Timeout, "health-check-timeout", server.DefaultHealthCheckTimeout, "Time each health check must complete in")
 	deployCommand.cmd.Flags().StringVar(&deployCommand.args.TargetOptions.HealthCheckConfig.Path, "health-check-path", server.DefaultHealthCheckPath, "Path to check for health")
@@ -107,6 +108,15 @@ func (c *deployCommand) preRun(cmd *cobra.Command, args []string) error {
 
 		if !slices.Contains(c.args.ServiceOptions.PathPrefixes, "/") {
 			return fmt.Errorf("TLS settings must be specified on the root path service")
+		}
+	}
+
+	if c.args.DeploymentOptions.TLSPreflightEnabled {
+		if !c.args.ServiceOptions.TLSEnabled {
+			return fmt.Errorf("tls-preflight requires TLS to be enabled")
+		}
+		if c.args.ServiceOptions.TLSCertificatePath != "" {
+			return fmt.Errorf("tls-preflight is not compatible with custom TLS certificates")
 		}
 	}
 

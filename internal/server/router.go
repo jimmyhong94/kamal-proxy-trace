@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +21,7 @@ var (
 	ErrorHostInUse                   = errors.New("host settings conflict with another service")
 	ErrorNoServerName                = errors.New("no server name provided")
 	ErrorUnknownServerName           = errors.New("unknown server name")
+	ErrorTLSPreflightFailed          = errors.New("TLS preflight failed")
 
 	contextKeyRoutingContext = contextKey("routing-context")
 )
@@ -36,9 +39,12 @@ func RoutingContext(r *http.Request) *routingContext {
 }
 
 type Router struct {
-	statePath   string
-	services    *ServiceMap
-	serviceLock sync.RWMutex
+	statePath        string
+	services         *ServiceMap
+	serviceLock      sync.RWMutex
+	preflight        *TLSPreflight
+	preflightLock    sync.RWMutex
+	preflightRunLock sync.Mutex
 }
 
 type ServiceDescription struct {
@@ -91,6 +97,18 @@ func (r *Router) RestoreLastSavedState() error {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if strings.HasPrefix(req.URL.Path, "/.well-known/acme-challenge/") {
+		r.preflightLock.RLock()
+		pf := r.preflight
+		r.preflightLock.RUnlock()
+
+		host := stripPort(req.Host)
+		if pf != nil && pf.HandlesHost(host) && !r.hostHasTLS(host) {
+			pf.HTTPHandler().ServeHTTP(w, req)
+			return
+		}
+	}
+
 	service, prefix := r.serviceForRequest(req)
 	if service == nil {
 		SetErrorResponse(w, req, http.StatusNotFound, nil)
@@ -108,6 +126,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func (r *Router) DeployService(name string, targetURLs, readerURLs []string, options ServiceOptions, targetOptions TargetOptions, deploymentOptions DeploymentOptions) error {
 	options.Normalize()
 	slog.Info("Deploying", "service", name, "targets", targetURLs, "hosts", options.Hosts, "paths", options.PathPrefixes, "tls", options.TLSEnabled)
+
+	if deploymentOptions.TLSPreflightEnabled {
+		if err := r.performTLSPreflight(name, options, deploymentOptions); err != nil {
+			return fmt.Errorf("%w: %w", ErrorTLSPreflightFailed, err)
+		}
+	}
 
 	lb, err := r.createLoadBalancer(targetURLs, readerURLs, options, targetOptions, deploymentOptions)
 	if err != nil {
@@ -272,17 +296,31 @@ func (r *Router) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 	}
 
 	service := r.serviceForHost(hello.ServerName)
-	if service == nil {
-		slog.Debug("ACME: Unable to get certificate (unknown server name)")
-		return nil, ErrorUnknownServerName
+	if service != nil && service.certManager != nil {
+		return service.certManager.GetCertificate(hello)
 	}
 
-	if service.certManager == nil {
+	// No TLS-capable service owns this host — check if preflight is
+	// verifying it. This handles TLS-ALPN-01 challenges for new hosts
+	// (or hosts being upgraded to TLS). HTTP-01 challenges are handled
+	// in ServeHTTP via ACME challenge path interception.
+	r.preflightLock.RLock()
+	pf := r.preflight
+	r.preflightLock.RUnlock()
+
+	if pf != nil {
+		cert, err := pf.GetCertificate(hello)
+		if cert != nil || err != nil {
+			return cert, err
+		}
+	}
+
+	if service != nil {
 		slog.Debug("ACME: Unable to get certificate (service does not support TLS)")
-		return nil, ErrorUnknownServerName
+	} else {
+		slog.Debug("ACME: Unable to get certificate (unknown server name)")
 	}
-
-	return service.certManager.GetCertificate(hello)
+	return nil, ErrorUnknownServerName
 }
 
 // Private
@@ -405,4 +443,89 @@ func (r *Router) withWriteLock(fn func() error) error {
 	defer r.serviceLock.Unlock()
 
 	return fn()
+}
+
+func (r *Router) performTLSPreflight(name string, options ServiceOptions, deploymentOptions DeploymentOptions) error {
+	newHosts := r.newHostsForService(name, options)
+	if len(newHosts) == 0 {
+		slog.Info("TLS preflight: no new hosts to verify", "service", name)
+		return nil
+	}
+
+	// Verify hosts won't conflict with other services before registering
+	// preflight handlers that could intercept their TLS/ACME traffic.
+	if conflict := r.checkHostAvailability(name, options); conflict != nil {
+		return fmt.Errorf("host settings conflict with service %q", conflict.name)
+	}
+
+	// Serialize preflight runs so overlapping deployments don't overwrite
+	// each other's preflight registration.
+	r.preflightRunLock.Lock()
+	defer r.preflightRunLock.Unlock()
+
+	slog.Info("TLS preflight: verifying new hosts", "service", name, "hosts", newHosts)
+
+	pf, err := NewTLSPreflight(newHosts, options.ACMECachePath, deploymentOptions.DeployTimeout)
+	if err != nil {
+		return err
+	}
+
+	r.registerPreflight(pf)
+	defer r.unregisterPreflight()
+
+	return pf.Run()
+}
+
+func (r *Router) newHostsForService(name string, options ServiceOptions) []string {
+	r.serviceLock.RLock()
+	defer r.serviceLock.RUnlock()
+
+	existing := r.services.Get(name)
+	if existing == nil || !existing.options.TLSEnabled {
+		return options.Hosts
+	}
+
+	var newHosts []string
+	existingHosts := make(map[string]bool, len(existing.options.Hosts))
+	for _, h := range existing.options.Hosts {
+		existingHosts[h] = true
+	}
+	for _, h := range options.Hosts {
+		if !existingHosts[h] {
+			newHosts = append(newHosts, h)
+		}
+	}
+	return newHosts
+}
+
+func (r *Router) hostHasTLS(host string) bool {
+	service := r.serviceForHost(host)
+	return service != nil && service.certManager != nil
+}
+
+func (r *Router) checkHostAvailability(name string, options ServiceOptions) *Service {
+	r.serviceLock.RLock()
+	defer r.serviceLock.RUnlock()
+
+	return r.services.CheckAvailability(name, options)
+}
+
+func (r *Router) registerPreflight(pf *TLSPreflight) {
+	r.preflightLock.Lock()
+	defer r.preflightLock.Unlock()
+	r.preflight = pf
+}
+
+func (r *Router) unregisterPreflight() {
+	r.preflightLock.Lock()
+	defer r.preflightLock.Unlock()
+	r.preflight = nil
+}
+
+func stripPort(host string) string {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	return h
 }

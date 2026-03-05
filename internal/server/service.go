@@ -72,9 +72,10 @@ type HealthCheckConfig struct {
 }
 
 type DeploymentOptions struct {
-	DeployTimeout time.Duration
-	DrainTimeout  time.Duration
-	Force         bool
+	DeployTimeout       time.Duration
+	DrainTimeout        time.Duration
+	Force               bool
+	TLSPreflightEnabled bool
 }
 
 type ServiceOptions struct {
