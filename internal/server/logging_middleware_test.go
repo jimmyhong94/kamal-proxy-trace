@@ -34,6 +34,7 @@ func TestMiddleware_LoggingMiddleware(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "http://app.example.com/somepath?q=ok", bytes.NewReader([]byte("hello")))
 	req.Header.Set("X-Request-ID", "request-id")
+	req.Header.Set("Traceparent", "00-4bf92f3577b6a27ff4a0b22e1bf81c16-00f067aa0ba902b7-01")
 	req.Header.Set("X-Forwarded-For", "192.168.1.1")
 	req.Header.Set("User-Agent", "Robot/1")
 	req.Header.Set("Content-Type", "application/json")
@@ -47,6 +48,7 @@ func TestMiddleware_LoggingMiddleware(t *testing.T) {
 		Message           string `json:"msg"`
 		Level             string `json:"level"`
 		RequestID         string `json:"request_id"`
+		TraceID           string `json:"trace_id"`
 		Host              string `json:"host"`
 		Port              int    `json:"port"`
 		Path              string `json:"path"`
@@ -76,6 +78,7 @@ func TestMiddleware_LoggingMiddleware(t *testing.T) {
 	assert.Equal(t, "Request", logline.Message)
 	assert.Equal(t, "INFO", logline.Level)
 	assert.Equal(t, "request-id", logline.RequestID)
+	assert.Equal(t, "4bf92f3577b6a27ff4a0b22e1bf81c16", logline.TraceID)
 	assert.Equal(t, "app.example.com", logline.Host)
 	assert.Equal(t, 80, logline.Port)
 	assert.Equal(t, "/somepath", logline.Path)
