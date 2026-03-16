@@ -83,6 +83,7 @@ func (h *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Int("port", port),
 			slog.String("path", r.URL.Path),
 			slog.String("request_id", r.Header.Get("X-Request-ID")),
+			slog.String("trace_id", extractTraceID(r.Header.Get("Traceparent"))),
 			slog.Int("status", writer.statusCode),
 			slog.String("service", loggingRequestContext.Service),
 			slog.String("target", loggingRequestContext.Target),
