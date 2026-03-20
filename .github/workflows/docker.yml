@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Lowercase owner
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -27,5 +30,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/kamal-proxy-trace:latest
-            ghcr.io/${{ github.repository_owner }}/kamal-proxy-trace:${{ github.sha }}
+            ghcr.io/${{ env.OWNER_LC }}/kamal-proxy-trace:latest
+            ghcr.io/${{ env.OWNER_LC }}/kamal-proxy-trace:${{ github.sha }}
