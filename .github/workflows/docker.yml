@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,5 +27,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/jimmyhong94/kamal-proxy-trace:latest
-            ghcr.io/jimmyhong94/kamal-proxy-trace:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/kamal-proxy-trace:latest
+            ghcr.io/${{ github.repository_owner }}/kamal-proxy-trace:${{ github.sha }}
